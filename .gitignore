@@ -1,0 +1,18 @@
+# ── Sensitive files ───────────────────────────────────────────────────────────
+sent_log.json
+sent_log_failed.json
+sent_log_bounce_state.json
+sent_log_opens.json
+email_verify_state.json
+*.db
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# ── PDFs (personal) ──────────────────────────────────────────────────────────
+*.pdf
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+*.xlsx

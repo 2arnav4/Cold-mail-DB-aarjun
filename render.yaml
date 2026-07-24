@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: aarjun-cold-mail-tracker
+    runtime: python
+    buildCommand: pip install -r tracker/requirements.txt
+    startCommand: gunicorn --chdir tracker app:app
+    envVars:
+      - key: DB_PATH
+        value: /var/data/tracker.db
+    disk:
+      name: tracker-data
+      mountPath: /var/data
+      sizeGB: 1
