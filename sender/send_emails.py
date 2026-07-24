@@ -397,7 +397,12 @@ def build_email(cfg: dict, contact: dict, subject: str, body: str) -> MIMEMultip
     msg = MIMEMultipart("mixed")  # outer container (holds alternative + attachment)
     msg["From"] = f"{cfg['your_name']} <{cfg['your_email']}>"
     msg["To"] = contact["contact_email"]
-    msg["Subject"] = final_subject
+    # RFC 2047-encode the subject explicitly — assigning a raw non-ASCII str
+    # (e.g. the "–" en dash in the template) here left it unencoded, and it
+    # was arriving corrupted as "â€"" once decoded on the recipient's end.
+    from email.header import Header
+
+    msg["Subject"] = Header(final_subject, "utf-8")
 
     # Inner multipart/alternative for plain + HTML
     alt = MIMEMultipart("alternative")
