@@ -641,7 +641,7 @@ def api_stats():
 
 @app.route("/")
 def index():
-    return "Cold Mail Tracker ✅ — visit /stats for dashboard"
+    return redirect("/stats", code=302)
 
 
 init_db()
