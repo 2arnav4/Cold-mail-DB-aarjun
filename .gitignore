@@ -1,14 +1,12 @@
 # ── Sensitive files ───────────────────────────────────────────────────────────
-sent_log.json
-sent_log_failed.json
-sent_log_bounce_state.json
-sent_log_opens.json
-email_verify_state.json
+# All sender state (sent log, failed log, bounce cursor, opens backup) lives
+# inside turso-full.db now — *.db covers it, no separate log files needed.
 *.db
 __pycache__/
 *.pyc
 *.pyo
 .env
+venv/
 
 # ── PDFs (personal) ──────────────────────────────────────────────────────────
 *.pdf

@@ -3,7 +3,8 @@
 Cold Mail Sender
 ----------------
 Reads contacts from turso-full.db, sends up to 20 cold emails per day
-via Gmail SMTP, tracks sent emails in sent_log.json, and attaches a resume.
+via Gmail SMTP, tracks all sender state (sent/failed/bounce-scan cursor/
+opens backup) in that same turso-full.db, and attaches a resume.
 
 Setup:
   1. Fill in CONFIG below (your Gmail, app password, resume path)
@@ -18,11 +19,10 @@ Gmail App Password (NOT your regular password):
 
 import sqlite3
 import smtplib
-import json
 import os
 import sys
 import argparse
-from datetime import date
+from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -59,7 +59,6 @@ CONFIG = {
     "resume_path": "Aarjun_Resume.pdf",
     "db_path": "turso-full.db",
     "template_path": "template_startups.txt",
-    "log_path": "sent_log.json",
     "daily_limit": 20,
     "tracker_url": _os.environ.get("TRACKER_URL", ""),
 }
@@ -96,82 +95,97 @@ CONTACT_QUERY = """
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Sender state — lives in the same turso-full.db as the contacts, instead of
+#  scattered sent_log*.json files. One database, one source of truth.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def load_log(log_path: str) -> dict:
-    """Load the sent log.
-    Structure: {
-      'sent': [...emails...],
-      'daily': {'YYYY-MM-DD': count},
-      'details': {'email': {'company': ..., 'sent_at': ...}}
-    }"""
-    if os.path.exists(log_path):
-        with open(log_path, "r") as f:
-            data = json.load(f)
-            # Ensure 'details' key exists for older logs
-            if "details" not in data:
-                data["details"] = {}
-            return data
-    return {"sent": [], "daily": {}, "details": {}}
+def init_state_tables(conn: sqlite3.Connection):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_emails (
+            email      TEXT PRIMARY KEY,
+            company    TEXT DEFAULT '',
+            sent_at    TEXT NOT NULL,
+            sent_date  TEXT NOT NULL,
+            status     TEXT DEFAULT 'sent'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS failed_sends (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            email        TEXT NOT NULL,
+            name         TEXT DEFAULT '',
+            company      TEXT DEFAULT '',
+            error        TEXT DEFAULT '',
+            bounce_type  TEXT DEFAULT '',
+            retry_after  TEXT DEFAULT '',
+            time         TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bounce_scan_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS opens_backup (
+            email       TEXT NOT NULL,
+            company     TEXT DEFAULT '',
+            opened_at   TEXT NOT NULL,
+            ip          TEXT DEFAULT '',
+            user_agent  TEXT DEFAULT '',
+            is_bot      INTEGER DEFAULT 0,
+            UNIQUE(email, opened_at)
+        )
+    """)
+    conn.commit()
 
 
-def save_log(log_path: str, log: dict):
-    with open(log_path, "w") as f:
-        json.dump(log, f, indent=2)
+def already_sent(conn: sqlite3.Connection, email: str) -> bool:
+    return conn.execute("SELECT 1 FROM sent_emails WHERE email = ?", (email,)).fetchone() is not None
 
 
-def load_failed_log(log_path: str) -> list:
-    """Load the failed sends log — a list of {email, company, error, timestamp} dicts."""
-    failed_path = log_path.replace(".json", "_failed.json")
-    if os.path.exists(failed_path):
-        with open(failed_path, "r") as f:
-            return json.load(f)
-    return []
+def sent_today(conn: sqlite3.Connection) -> int:
+    today = str(date.today())
+    row = conn.execute(
+        "SELECT COUNT(*) FROM sent_emails WHERE sent_date = ? AND status != 'bounced'",
+        (today,),
+    ).fetchone()
+    return row[0]
 
 
-def record_failed(log_path: str, contact: dict, error: str):
-    """Append a failed send to failed_log.json."""
-    from datetime import datetime
-
-    failed_path = log_path.replace(".json", "_failed.json")
-    failed = load_failed_log(log_path)
-    failed.append(
-        {
-            "email": contact["contact_email"],
-            "name": contact.get("contact_name") or "",
-            "company": contact.get("company_name") or "",
-            "error": str(error),
-            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+def record_sent(conn: sqlite3.Connection, email: str, company: str = ""):
+    """Record a successful send. Commits immediately — safe against crashes
+    mid-run, same as the old save-after-each-send behavior."""
+    sent_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT OR REPLACE INTO sent_emails (email, company, sent_at, sent_date, status) "
+        "VALUES (?, ?, ?, ?, 'sent')",
+        (email, company, sent_at, str(date.today())),
     )
-    with open(failed_path, "w") as f:
-        json.dump(failed, f, indent=2)
+    conn.commit()
 
 
-def already_sent(log: dict, email: str) -> bool:
-    return email in log["sent"]
+def record_failed(conn: sqlite3.Connection, contact: dict, error: str, bounce_type: str = "", retry_after: str = ""):
+    conn.execute(
+        "INSERT INTO failed_sends (email, name, company, error, bounce_type, retry_after, time) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            contact["contact_email"],
+            contact.get("contact_name") or "",
+            contact.get("company_name") or "",
+            str(error),
+            bounce_type,
+            retry_after,
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
 
 
-def sent_today(log: dict) -> int:
-    today = str(date.today())
-    return log["daily"].get(today, 0)
-
-
-def record_sent(log: dict, email: str, company: str = ""):
-    """Record a successful send — email list, daily count, and per-email details."""
-    from datetime import datetime
-
-    today = str(date.today())
-    log["sent"].append(email)
-    log["daily"][today] = log["daily"].get(today, 0) + 1
-    log["details"][email] = {
-        "company": company,
-        "sent_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def sync_tracker_from_logs(cfg: dict):
-    """Re-sync all local sent/bounce/open logs to the Render tracker.
+def sync_tracker_from_db(cfg: dict, conn: sqlite3.Connection):
+    """Re-sync all sent/bounce/open state to the Render tracker.
     Also downloads new opens from the tracker to back them up locally,
     making the dashboard fully persistent across Render restarts."""
     tracker_url = cfg.get("tracker_url", "").rstrip("/")
@@ -180,24 +194,15 @@ def sync_tracker_from_logs(cfg: dict):
 
     import urllib.request, json as _json
 
-    log = load_log(cfg["log_path"])
-    failed = load_failed_log(cfg["log_path"])
-
-    # Load local opens backup
-    opens_path = cfg["log_path"].replace(".json", "_opens.json")
-    local_opens = []
-    if os.path.exists(opens_path):
-        try:
-            with open(opens_path, "r") as f:
-                local_opens = _json.load(f)
-        except Exception:
-            pass
+    bounced_emails_set = {
+        r[0].lower() for r in conn.execute("SELECT DISTINCT email FROM failed_sends").fetchall()
+    }
 
     # Exclude any false opens for bounced emails from the local backup
-    bounced_emails_set = {b["email"].lower() for b in failed}
-    local_opens = [
-        o for o in local_opens if o["email"].lower() not in bounced_emails_set
-    ]
+    conn.execute(
+        "DELETE FROM opens_backup WHERE LOWER(email) IN (SELECT LOWER(email) FROM failed_sends)"
+    )
+    conn.commit()
 
     # 1. Download current opens from Render to back them up locally
     try:
@@ -205,54 +210,53 @@ def sync_tracker_from_logs(cfg: dict):
         with urllib.request.urlopen(req, timeout=10) as resp:
             server_opens = _json.loads(resp.read())
 
-        # Merge server opens into local backup (deduplicate by (email, opened_at)), skipping bounces
-        local_keys = {(o["email"], o["opened_at"]) for o in local_opens}
-        added_new = False
         for o in server_opens:
-            if o["email"].lower() in bounced_emails_set:
-                continue  # Skip false opens on bounced emails
-            key = (o["email"], o["opened_at"])
-            if key not in local_keys:
-                local_opens.append(o)
-                local_keys.add(key)
-                added_new = True
-
-        # Always write the clean opens list to the local backup
-        local_opens.sort(key=lambda x: x.get("opened_at", ""), reverse=True)
-        with open(opens_path, "w") as f:
-            _json.dump(local_opens, f, indent=2)
+            if o.get("email", "").lower() in bounced_emails_set:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO opens_backup (email, company, opened_at, ip, user_agent, is_bot) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    o.get("email", ""),
+                    o.get("company", ""),
+                    o.get("opened_at", ""),
+                    o.get("ip", ""),
+                    o.get("user_agent", ""),
+                    o.get("is_bot", 0),
+                ),
+            )
+        conn.commit()
     except Exception as err:
         print(f"  Warning: Could not fetch opens backup from server: {err}")
 
-    # Build sends payload from the details dict (has company + sent_at)
     sends = [
-        {
-            "email": email,
-            "company": info.get("company", ""),
-            "sent_at": info.get("sent_at", ""),
-        }
-        for email, info in log.get("details", {}).items()
+        {"email": r[0], "company": r[1], "sent_at": r[2]}
+        for r in conn.execute("SELECT email, company, sent_at FROM sent_emails").fetchall()
     ]
-    # Fall back: emails in sent[] with no details entry get a bare record
-    details_emails = set(log.get("details", {}).keys())
-    for email in log.get("sent", []):
-        if email not in details_emails:
-            sends.append({"email": email, "company": "", "sent_at": ""})
 
     bounces = [
         {
-            "email": b["email"],
-            "company": b.get("company", ""),
-            "reason": b.get("error", "Bounce — invalid address"),
-            "sent_at": b.get("time", ""),
+            "email": r[0],
+            "company": r[1],
+            "reason": r[2],
+            "bounce_type": r[3],
+            "retry_after": r[4],
+            "sent_at": r[5],
         }
-        for b in failed
+        for r in conn.execute(
+            "SELECT email, company, error, bounce_type, retry_after, time FROM failed_sends"
+        ).fetchall()
+    ]
+
+    opens = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT email, company, opened_at, ip, user_agent, is_bot FROM opens_backup"
+        ).fetchall()
     ]
 
     try:
-        payload = _json.dumps(
-            {"sends": sends, "bounces": bounces, "opens": local_opens}
-        ).encode()
+        payload = _json.dumps({"sends": sends, "bounces": bounces, "opens": opens}).encode()
         req = urllib.request.Request(
             f"{tracker_url}/api/bulk_sync",
             data=payload,
@@ -415,42 +419,26 @@ def build_email(cfg: dict, contact: dict, subject: str, body: str) -> MIMEMultip
     return msg
 
 
-def remove_contacted_from_db(db_path: str, log_path: str):
+def remove_contacted_from_db(conn: sqlite3.Connection):
     """Clean up contacted email addresses from the local database before sending."""
     try:
-        contacted_emails = set()
-        if os.path.exists(log_path):
-            with open(log_path, "r") as f:
-                log_data = json.load(f)
-                contacted_emails.update(log_data.get("sent", []))
-        
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT DISTINCT email FROM contacts WHERE id IN (SELECT contact_id FROM send_queue WHERE status IN ('SENT', 'DONE'))")
-        for row in cur.fetchall():
-            if row[0]:
-                contacted_emails.add(row[0])
-            
-        if contacted_emails:
-            to_delete = [(email,) for email in contacted_emails if email]
-            cur.executemany("DELETE FROM contacts WHERE email = ?", to_delete)
-            conn.commit()
-            deleted_count = conn.total_changes
-            if deleted_count > 0:
-                print(f"  Pre-send Cleanup: Removed {deleted_count} already-contacted contacts from local database.")
-        conn.close()
+        conn.execute("DELETE FROM contacts WHERE email IN (SELECT email FROM sent_emails)")
+        conn.execute(
+            "DELETE FROM contacts WHERE id IN "
+            "(SELECT contact_id FROM send_queue WHERE status IN ('SENT', 'DONE'))"
+        )
+        deleted_count = conn.total_changes
+        conn.commit()
+        if deleted_count > 0:
+            print(f"  Pre-send Cleanup: Removed already-contacted contacts from local database.")
     except Exception as e:
         print(f"  Warning: Pre-send database cleanup failed: {e}")
 
 
-def fetch_contacts(db_path: str) -> list:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+def fetch_contacts(conn: sqlite3.Connection) -> list:
     cur = conn.cursor()
     cur.execute(CONTACT_QUERY)
-    rows = [dict(row) for row in cur.fetchall()]
-    conn.close()
-    return rows
+    return [dict(row) for row in cur.fetchall()]
 
 
 def print_summary(sent: list, skipped: int, remaining_today: int, dry_run: bool):
@@ -467,31 +455,23 @@ def print_summary(sent: list, skipped: int, remaining_today: int, dry_run: bool)
     print(f"{'─' * 50}\n")
 
 
-def check_and_sync_bounces(cfg: dict) -> list:
+def check_and_sync_bounces(cfg: dict, conn: sqlite3.Connection) -> list:
     """Connects to Gmail via IMAP, detects bounces using DSN parsing, classifies them,
-    updates daily quotas for the actual send dates, and syncs to the Render tracker."""
+    marks the matching sent_emails rows as bounced (so they stop counting against
+    today's quota), and syncs to the Render tracker."""
     import imaplib
     import email as _email
     import re
     import urllib.request as _urllib
     import json as _json
-    from datetime import datetime
 
     print("Checking Gmail for new bounces via IMAP...")
     email_addr = cfg["your_email"]
     app_pwd = cfg["app_password"].replace(" ", "")
     tracker_url = cfg.get("tracker_url", "").rstrip("/")
 
-    # Persisted UID state
-    state_path = cfg["log_path"].replace(".json", "_bounce_state.json")
-    last_uid = 0
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, "r") as f:
-                state_data = _json.load(f)
-                last_uid = state_data.get("last_uid", 0)
-        except Exception:
-            pass
+    row = conn.execute("SELECT value FROM bounce_scan_state WHERE key='last_uid'").fetchone()
+    last_uid = int(row[0]) if row else 0
 
     bounced_records = []  # list of {email, reason, bounce_type, retry_after}
 
@@ -650,8 +630,12 @@ def check_and_sync_bounces(cfg: dict) -> list:
         # Update persisted state with the max UID processed
         if max_uid > last_uid:
             try:
-                with open(state_path, "w") as f:
-                    _json.dump({"last_uid": max_uid}, f)
+                conn.execute(
+                    "INSERT INTO bounce_scan_state (key, value) VALUES ('last_uid', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(max_uid),),
+                )
+                conn.commit()
             except Exception as se:
                 print(f"  Warning: Could not save bounce scan state: {se}")
 
@@ -671,35 +655,43 @@ def check_and_sync_bounces(cfg: dict) -> list:
         f"  Detected {len(bounced_records)} bounces — {hard} hard, {soft} soft, {unknown} unknown: {bounced_emails}"
     )
 
-    log = load_log(cfg["log_path"])
-    failed = load_failed_log(cfg["log_path"])
-    existing_failed = {item["email"] for item in failed}
+    existing_failed = {
+        r[0] for r in conn.execute("SELECT DISTINCT email FROM failed_sends").fetchall()
+    }
 
     new_bounces_logged = 0
 
     for rec in bounced_records:
         email = rec["email"]
 
-        if email not in log["sent"]:
-            log["sent"].append(email)
-
-            # Decrement daily quota for the actual send date
-            sent_at = log.get("details", {}).get(email, {}).get("sent_at", "")
-            sent_day = sent_at.split(" ")[0] if sent_at else None
-            if sent_day and sent_day in log["daily"]:
-                log["daily"][sent_day] = max(0, log["daily"][sent_day] - 1)
+        existing_sent = conn.execute(
+            "SELECT company FROM sent_emails WHERE email = ?", (email,)
+        ).fetchone()
+        if existing_sent:
+            # Mark bounced so it stops counting against today's quota, but keep
+            # the row so already_sent() still guards against re-queuing it.
+            conn.execute("UPDATE sent_emails SET status='bounced' WHERE email = ?", (email,))
+            company = existing_sent[0]
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO sent_emails (email, company, sent_at, sent_date, status) "
+                "VALUES (?, '', ?, ?, 'bounced')",
+                (email, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), str(date.today())),
+            )
+            company = ""
 
         if email not in existing_failed:
-            failed.append(
-                {
-                    "email": email,
-                    "name": "",
-                    "company": log.get("details", {}).get(email, {}).get("company", ""),
-                    "error": rec["reason"],
-                    "bounce_type": rec["bounce_type"],
-                    "retry_after": rec["retry_after"],
-                    "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                }
+            conn.execute(
+                "INSERT INTO failed_sends (email, name, company, error, bounce_type, retry_after, time) "
+                "VALUES (?, '', ?, ?, ?, ?, ?)",
+                (
+                    email,
+                    company,
+                    rec["reason"],
+                    rec["bounce_type"],
+                    rec["retry_after"],
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
             )
             new_bounces_logged += 1
 
@@ -724,30 +716,15 @@ def check_and_sync_bounces(cfg: dict) -> list:
                 except Exception as te:
                     print(f"    Tracker log_bounce failed for {email}: {te}")
 
-    save_log(cfg["log_path"], log)
+    conn.commit()
 
-    failed_path = cfg["log_path"].replace(".json", "_failed.json")
-    with open(failed_path, "w") as f:
-        _json.dump(failed, f, indent=2)
-
-    # Clean local SQLite database
+    # Clean local SQLite database — only remove hard bounces (soft/unknown may still be valid)
     try:
-        # Only remove hard bounces from DB — soft/unknown bounces may still be valid
-        hard_emails = [
-            r["email"] for r in bounced_records if r["bounce_type"] == "hard"
-        ]
+        hard_emails = [r["email"] for r in bounced_records if r["bounce_type"] == "hard"]
         if hard_emails:
-            conn = sqlite3.connect(cfg["db_path"])
-            cur = conn.cursor()
-            cur.executemany(
-                "DELETE FROM contacts WHERE email = ?", [(e,) for e in hard_emails]
-            )
+            conn.executemany("DELETE FROM contacts WHERE email = ?", [(e,) for e in hard_emails])
             conn.commit()
-            deleted_count = conn.total_changes
-            conn.close()
-            print(
-                f"  Removed {deleted_count} hard-bounced contacts from local database."
-            )
+            print(f"  Removed hard-bounced contacts from local database.")
     except Exception as dbe:
         print(f"  Warning: Database cleanup failed: {dbe}")
 
@@ -755,38 +732,31 @@ def check_and_sync_bounces(cfg: dict) -> list:
     return bounced_emails
 
 
-
-def move_to_wrong_address(db_path: str, contact: dict, service: str, reason: str):
+def move_to_wrong_address(conn: sqlite3.Connection, contact: dict, service: str, reason: str):
     """Remove a contact from `contacts` and record it in `wrong_address` so it
     never resurfaces in a future CONTACT_QUERY."""
-    from datetime import datetime
+    conn.execute(
+        """
+        INSERT INTO wrong_address
+            (original_contact_id, company_id, company_name, name, role, email,
+             failed_service, invalid_reason, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            contact["contact_id"],
+            contact.get("company_id"),
+            contact.get("company_name"),
+            contact.get("contact_name"),
+            contact.get("contact_role"),
+            contact["contact_email"],
+            service,
+            reason,
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.execute("DELETE FROM contacts WHERE id = ?", (contact["contact_id"],))
+    conn.commit()
 
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            INSERT INTO wrong_address
-                (original_contact_id, company_id, company_name, name, role, email,
-                 failed_service, invalid_reason, checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                contact["contact_id"],
-                contact.get("company_id"),
-                contact.get("company_name"),
-                contact.get("contact_name"),
-                contact.get("contact_role"),
-                contact["contact_email"],
-                service,
-                reason,
-                datetime.now().isoformat(),
-            ),
-        )
-        cur.execute("DELETE FROM contacts WHERE id = ?", (contact["contact_id"],))
-        conn.commit()
-    finally:
-        conn.close()
 
 def main():
     parser = argparse.ArgumentParser(description="Cold Mail Sender")
@@ -809,7 +779,7 @@ def main():
     parser.add_argument(
         "--check-bounces",
         action="store_true",
-        help="Check Gmail for bounced emails, sync them to logs, clean DB, and exit",
+        help="Check Gmail for bounced emails, sync them to the DB, clean up, and exit",
     )
     args = parser.parse_args()
     dry_run = args.dry_run
@@ -818,29 +788,35 @@ def main():
     if args.daily_limit:
         cfg["daily_limit"] = args.daily_limit
 
+    conn = sqlite3.connect(cfg["db_path"])
+    conn.row_factory = sqlite3.Row
+    init_state_tables(conn)
+
     # Handle manual bounce check flag
     if args.check_bounces:
-        check_and_sync_bounces(cfg)
+        check_and_sync_bounces(cfg, conn)
+        conn.close()
         sys.exit(0)
 
     # Validate config
     if not dry_run:
         if cfg["your_email"] == "you@gmail.com":
             print("ERROR: Please set your_email in CONFIG before running.")
+            conn.close()
             sys.exit(1)
         if cfg["app_password"] == "xxxx xxxx xxxx xxxx":
             print("ERROR: Please set your Gmail app_password in CONFIG before running.")
+            conn.close()
             sys.exit(1)
 
     # Automatically check for bounces on startup (if not a dry run)
     if not dry_run:
-        check_and_sync_bounces(cfg)
+        check_and_sync_bounces(cfg, conn)
         # Re-sync all local data to Render so dashboard survives server restarts
-        sync_tracker_from_logs(cfg)
+        sync_tracker_from_db(cfg, conn)
 
     # Load state
-    log = load_log(cfg["log_path"])
-    already_sent_today = sent_today(log)
+    already_sent_today = sent_today(conn)
     quota_left = cfg["daily_limit"] - already_sent_today
 
     # --limit caps how many we send THIS run (not the daily total)
@@ -854,26 +830,29 @@ def main():
 
     if quota_left <= 0:
         print("  Daily limit already reached. Come back tomorrow!")
+        conn.close()
         sys.exit(0)
 
     # Load template
     if not os.path.exists(cfg["template_path"]):
         print(f"ERROR: Template file not found: {cfg['template_path']}")
+        conn.close()
         sys.exit(1)
     subject_template, body_template = load_template(cfg["template_path"])
     if not subject_template:
         print("ERROR: Template missing 'Subject:' line on the first line.")
+        conn.close()
         sys.exit(1)
 
     # Pre-send check: remove already contacted addresses from database
-    remove_contacted_from_db(cfg["db_path"], cfg["log_path"])
+    remove_contacted_from_db(conn)
 
     # Fetch contacts
-    all_contacts = fetch_contacts(cfg["db_path"])
+    all_contacts = fetch_contacts(conn)
     print(f"  Total contacts in DB: {len(all_contacts)}")
 
     # Filter out already-sent
-    queue = [c for c in all_contacts if not already_sent(log, c["contact_email"])]
+    queue = [c for c in all_contacts if not already_sent(conn, c["contact_email"])]
     print(f"  Unsent contacts     : {len(queue)}")
 
     if args.show_queue:
@@ -882,6 +861,7 @@ def main():
             print(
                 f"    {c['contact_email']:40s} | {c['company_name']} | {c['contact_role']}"
             )
+        conn.close()
         sys.exit(0)
 
     # Take only what we're allowed today
@@ -890,6 +870,7 @@ def main():
 
     if not batch:
         print("  All contacts have been emailed!")
+        conn.close()
         sys.exit(0)
 
     # Send
@@ -907,6 +888,7 @@ def main():
                 "  Make sure you're using an App Password, not your regular password."
             )
             print("  Generate one at: https://myaccount.google.com/apppasswords")
+            conn.close()
             sys.exit(1)
 
     # In dry-run we just preview the top of the queue. In a real run, invalid
@@ -932,10 +914,9 @@ def main():
                 is_valid, checked_by = verify_email(email_addr)
                 if not is_valid:
                     print(f"         Invalid ({checked_by}). Moving to wrong_address, skipping.")
-                    record_failed(cfg["log_path"], contact, f"Failed verification: {checked_by}")
-                    move_to_wrong_address(cfg["db_path"], contact, checked_by, "failed verification")
+                    record_failed(conn, contact, f"Failed verification: {checked_by}")
+                    move_to_wrong_address(conn, contact, checked_by, "failed verification")
                     continue
-
 
             if dry_run:
                 personalized = PERSONALIZED_EMAILS.get(email_addr)
@@ -953,17 +934,14 @@ def main():
                 print()
                 sent_this_run.append(
                     contact
-                )  # track for summary display only, do NOT write to log
+                )  # track for summary display only, do NOT write to the DB
                 continue
 
             try:
                 msg = build_email(cfg, contact, subject_template, body_template)
                 smtp_conn.send_message(msg)
-                record_sent(log, email_addr, company)
+                record_sent(conn, email_addr, company)  # commits immediately
                 sent_this_run.append(contact)
-                save_log(
-                    cfg["log_path"], log
-                )  # Save after each send (safe against crashes)
 
                 # Notify tracking server of successful send
                 tracker_url = cfg.get("tracker_url", "").rstrip("/")
@@ -988,16 +966,17 @@ def main():
                 print(f"         SENT")
             except Exception as e:
                 print(f"         FAILED: {e}")
-                record_failed(cfg["log_path"], contact, e)  # Log to failed_log.json
+                record_failed(conn, contact, e)
 
     finally:
         if smtp_conn:
             smtp_conn.quit()
 
-    # Dry run never writes to the log — nothing was actually sent
+    # Dry run never writes to the DB — nothing was actually sent
 
-    remaining = cfg["daily_limit"] - sent_today(log)
+    remaining = cfg["daily_limit"] - sent_today(conn)
     print_summary(sent_this_run, skipped_count, remaining, dry_run)
+    conn.close()
 
 
 if __name__ == "__main__":
