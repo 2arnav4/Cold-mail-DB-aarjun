@@ -92,11 +92,10 @@ def ping():
     return jsonify({"status": "ok", "ts": datetime.utcnow().isoformat()}), 200
 
 
-KNOWN_PROXY_UA_SUBSTRINGS = [
-    # Mail-provider image proxies / link-preview fetchers
-    "GoogleImageProxy",  # Gmail's image proxy — fetches once, caches on Google's side
+ALWAYS_BOT_UA_SUBSTRINGS = [
+    # Security-scanning / link-preview fetchers — automated, with no
+    # legitimate "this is a human reading the email" path at all.
     "Google-Safety",  # Google link/attachment scanning
-    "YahooMailProxy",
     "MicrosoftPreview",  # Outlook/O365 link preview
     "OutlookSafeLinksScanner",
     "ATP-Scan",  # Microsoft Defender for Office 365 Safe Links
@@ -131,6 +130,18 @@ KNOWN_PROXY_UA_SUBSTRINGS = [
     "java/",
 ]
 
+# NOT in the always-bot list on purpose: GoogleImageProxy/ggpht.com (Gmail &
+# Google Workspace) and YahooMailProxy route EVERY remote-image fetch through
+# their own proxy — both an automated security prescan done at delivery time
+# AND a real human actually opening the email in Gmail/Workspace come through
+# the identical proxy IP range and UA. There is no signature that tells the
+# two apart; only elapsed time does, so these fall through to the timing
+# check below instead of being flagged unconditionally. Flagging them always
+# (as before) meant a genuine open, occurring minutes later through the same
+# proxy, was permanently mislabeled as a bot — which is exactly what made
+# Confirmed Opens read 0 even for emails that were clearly opened more than
+# once, well after the initial prescan.
+
 
 def classify_bot(user_agent: str, seconds_since_send: float) -> bool:
     ua = (user_agent or "").lower()
@@ -139,7 +150,7 @@ def classify_bot(user_agent: str, seconds_since_send: float) -> bool:
         # fetching a remote image or following a link; a blank one is far
         # more consistent with an automated scanner than a human.
         return True
-    if any(sig.lower() in ua for sig in KNOWN_PROXY_UA_SUBSTRINGS):
+    if any(sig.lower() in ua for sig in ALWAYS_BOT_UA_SUBSTRINGS):
         return True
     if seconds_since_send is not None and seconds_since_send < 45:
         # Security gateways and privacy-preserving prefetchers (Apple Mail
@@ -285,6 +296,44 @@ def purge():
                 )
             conn.commit()
         return jsonify({"purged": emails}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Recompute is_bot on already-stored rows using the current classify_bot
+#    logic (e.g. after a classifier change, so historical rows aren't stuck
+#    with a verdict made under the old rules) ─────────────────────────────────
+@app.route("/api/recompute_bot", methods=["POST"])
+def recompute_bot():
+    try:
+        changed = {"opens": 0, "clicks": 0}
+        with get_db() as conn:
+            sent_at_by_email = {
+                row["email"]: row["sent_at"]
+                for row in conn.execute("SELECT email, sent_at FROM sends").fetchall()
+            }
+            for table, ts_col in (("opens", "opened_at"), ("clicks", "clicked_at")):
+                rows = conn.execute(
+                    f"SELECT id, email, user_agent, {ts_col} as ts, is_bot FROM {table}"
+                ).fetchall()
+                for row in rows:
+                    sent_at = sent_at_by_email.get(row["email"])
+                    seconds_since_send = None
+                    if sent_at:
+                        try:
+                            sent_dt = datetime.strptime(sent_at, "%Y-%m-%d %H:%M:%S")
+                            ts_dt = datetime.strptime(row["ts"], "%Y-%m-%d %H:%M:%S")
+                            seconds_since_send = (ts_dt - sent_dt).total_seconds()
+                        except Exception:
+                            pass
+                    new_is_bot = 1 if classify_bot(row["user_agent"], seconds_since_send) else 0
+                    if new_is_bot != row["is_bot"]:
+                        conn.execute(
+                            f"UPDATE {table} SET is_bot=? WHERE id=?", (new_is_bot, row["id"])
+                        )
+                        changed[table] += 1
+            conn.commit()
+        return jsonify({"reclassified": changed}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
