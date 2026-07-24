@@ -37,7 +37,7 @@ import os as _os
 def _load_env(path=".env"):
     """Parse a .env file and inject into os.environ (no dependencies needed)."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -283,7 +283,12 @@ def load_template(template_path: str) -> tuple:
       Blank line
       Rest: body
     """
-    with open(template_path, "r") as f:
+    # Explicit UTF-8: Python's default text-mode encoding is locale-dependent,
+    # and on Windows that's commonly cp1252, not UTF-8. Reading this UTF-8
+    # file without specifying that turned the "–" en dash's 3 UTF-8 bytes
+    # into "â€"" right here at read time — before any header-encoding fix
+    # downstream could do anything about it.
+    with open(template_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     lines = content.splitlines()
