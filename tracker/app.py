@@ -268,6 +268,27 @@ def bulk_sync():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Purge specific emails (e.g. rows synced in by mistake) ──────────────────
+@app.route("/api/purge", methods=["POST"])
+def purge():
+    data = request.get_json() or {}
+    emails = [e.lower() for e in data.get("emails", []) if e]
+    if not emails:
+        return jsonify({"error": "Missing emails"}), 400
+    try:
+        with get_db() as conn:
+            placeholders = ",".join("?" * len(emails))
+            for table in ("sends", "opens", "clicks"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE LOWER(email) IN ({placeholders})",
+                    emails,
+                )
+            conn.commit()
+        return jsonify({"purged": emails}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ── Tracking pixel ────────────────────────────────────────────────────────────
 @app.route("/t/<path:encoded>.gif")
 def track(encoded):

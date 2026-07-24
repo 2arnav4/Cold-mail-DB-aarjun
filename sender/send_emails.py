@@ -234,6 +234,9 @@ def sync_tracker_from_db(cfg: dict, conn: sqlite3.Connection):
         for r in conn.execute("SELECT email, company, sent_at FROM sent_emails").fetchall()
     ]
 
+    # Exclude pre-send verification failures — those addresses never actually
+    # got a send attempt, so they must never appear in the tracker's "sends"
+    # table (that would inflate Total Sent with emails that were never sent).
     bounces = [
         {
             "email": r[0],
@@ -244,7 +247,8 @@ def sync_tracker_from_db(cfg: dict, conn: sqlite3.Connection):
             "sent_at": r[5],
         }
         for r in conn.execute(
-            "SELECT email, company, error, bounce_type, retry_after, time FROM failed_sends"
+            "SELECT email, company, error, bounce_type, retry_after, time FROM failed_sends "
+            "WHERE bounce_type != 'verification'"
         ).fetchall()
     ]
 
@@ -927,7 +931,7 @@ def main():
                 is_valid, checked_by = verify_email(email_addr)
                 if not is_valid:
                     print(f"         Invalid ({checked_by}). Moving to wrong_address, skipping.")
-                    record_failed(conn, contact, f"Failed verification: {checked_by}")
+                    record_failed(conn, contact, f"Failed verification: {checked_by}", bounce_type="verification")
                     move_to_wrong_address(conn, contact, checked_by, "failed verification")
                     continue
 
