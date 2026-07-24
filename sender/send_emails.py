@@ -59,7 +59,7 @@ CONFIG = {
     "resume_path": "Aarjun_Resume.pdf",
     "db_path": "turso-full.db",
     "template_path": "template_startups.txt",
-    "daily_limit": 20,
+    "daily_limit": 100,
     "tracker_url": _os.environ.get("TRACKER_URL", ""),
 }
 
@@ -781,6 +781,11 @@ def main():
         action="store_true",
         help="Check Gmail for bounced emails, sync them to the DB, clean up, and exit",
     )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Refresh the tracker only: check bounces + push sends/bounces/opens to Render, then exit. Never sends email.",
+    )
     args = parser.parse_args()
     dry_run = args.dry_run
     cfg = CONFIG.copy()
@@ -791,6 +796,14 @@ def main():
     conn = sqlite3.connect(cfg["db_path"])
     conn.row_factory = sqlite3.Row
     init_state_tables(conn)
+
+    # Refresh-only: identical to the sync step that normally runs before a real
+    # send, but exits immediately after so it can never trigger a send.
+    if args.sync:
+        check_and_sync_bounces(cfg, conn)
+        sync_tracker_from_db(cfg, conn)
+        conn.close()
+        sys.exit(0)
 
     # Handle manual bounce check flag
     if args.check_bounces:

@@ -93,19 +93,61 @@ def ping():
 
 
 KNOWN_PROXY_UA_SUBSTRINGS = [
+    # Mail-provider image proxies / link-preview fetchers
     "GoogleImageProxy",  # Gmail's image proxy — fetches once, caches on Google's side
     "Google-Safety",  # Google link/attachment scanning
+    "YahooMailProxy",
     "MicrosoftPreview",  # Outlook/O365 link preview
     "OutlookSafeLinksScanner",
     "ATP-Scan",  # Microsoft Defender for Office 365 Safe Links
+    "SafeLinks",
+    # Corporate email-security gateways that prefetch links/images to scan them
+    "Proofpoint",
+    "Mimecast",
+    "URLProtect",  # Mimecast URL Protect
+    "Barracuda",
+    "MailScanner",
+    "Symantec",
+    "zscaler",
+    "trend micro",
+    "bitdefender",
+    "fireeye",
+    "checkpoint",
+    "forcepoint",
+    # Generic non-browser HTTP client libraries — a real mail client rendering
+    # an <img> tag never identifies itself this way, so seeing one of these
+    # fetch a tracking pixel/link is a strong bot/monitoring-tool signal
+    "curl/",
+    "wget/",
+    "python-requests",
+    "python-urllib",
+    "go-http-client",
+    "okhttp",
+    "libwww-perl",
+    "apache-httpclient",
+    "node-fetch",
+    "axios/",
+    "postmanruntime",
+    "java/",
 ]
 
 
 def classify_bot(user_agent: str, seconds_since_send: float) -> bool:
     ua = (user_agent or "").lower()
+    if not ua:
+        # Real mail clients/browsers virtually always send a User-Agent when
+        # fetching a remote image or following a link; a blank one is far
+        # more consistent with an automated scanner than a human.
+        return True
     if any(sig.lower() in ua for sig in KNOWN_PROXY_UA_SUBSTRINGS):
         return True
-    if seconds_since_send is not None and seconds_since_send < 10:
+    if seconds_since_send is not None and seconds_since_send < 45:
+        # Security gateways and privacy-preserving prefetchers (Apple Mail
+        # Privacy Protection, corporate ATP/URL-scanning) almost always fetch
+        # within seconds of delivery, well before a human has even seen the
+        # message land. A real read this fast is rare enough that treating it
+        # as a bot open trades a few false negatives for far fewer false
+        # positives on the "confirmed" numbers.
         return True
     return False
 
