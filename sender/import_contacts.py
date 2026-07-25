@@ -58,6 +58,60 @@ FREE_MAIL_DOMAINS = {
 
 EMAIL_RE = re.compile(r"^[\w.+\-']+@[\w\-]+(\.[\w\-]+)+$")
 
+# Schema for the contact side of the database. On a fresh clone turso-full.db
+# does not exist at all — it is gitignored, because it is a binary that every
+# send mutates and git cannot merge. This recreates it so that cloning the
+# repo and running this script is enough to get a working queue. The state
+# tables (sent_emails, failed_sends, bounce_scan_state, opens_backup) are left
+# to send_emails.py's init_state_tables(), which owns them.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS companies (
+    id INTEGER NOT NULL,
+    domain VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    source VARCHAR(32) NOT NULL,
+    funding_stage VARCHAR(32),
+    industry VARCHAR(64),
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (domain)
+);
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER NOT NULL,
+    company_id INTEGER NOT NULL,
+    name VARCHAR(255),
+    role VARCHAR(128),
+    email VARCHAR(255),
+    email_confidence INTEGER,
+    email_verified BOOLEAN DEFAULT 0 NOT NULL,
+    is_invalid BOOLEAN DEFAULT 0 NOT NULL,
+    created_at DATETIME NOT NULL,
+    source TEXT(64),
+    priority INTEGER DEFAULT 0,
+    PRIMARY KEY (id),
+    UNIQUE (email),
+    FOREIGN KEY(company_id) REFERENCES companies (id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS send_queue (
+    id INTEGER NOT NULL,
+    contact_id INTEGER,
+    status VARCHAR(16) DEFAULT 'PENDING' NOT NULL,
+    PRIMARY KEY (id)
+);
+CREATE TABLE IF NOT EXISTS wrong_address (
+    id INTEGER PRIMARY KEY,
+    original_contact_id INTEGER,
+    company_id INTEGER,
+    company_name VARCHAR(255),
+    name VARCHAR(255),
+    role VARCHAR(128),
+    email VARCHAR(255) NOT NULL,
+    failed_service VARCHAR(32) NOT NULL,
+    invalid_reason VARCHAR(64),
+    checked_at DATETIME NOT NULL
+);
+"""
+
 
 def detect_columns(fieldnames):
     """Map the CSV's actual headers onto the fields we need."""
@@ -133,9 +187,7 @@ def main():
     if not os.path.exists(args.csv_path):
         print(f"ERROR: CSV not found: {args.csv_path}")
         sys.exit(1)
-    if not os.path.exists(args.db):
-        print(f"ERROR: Database not found: {args.db}")
-        sys.exit(1)
+    fresh = not os.path.exists(args.db)
 
     # utf-8-sig: these files come out of Excel, which writes a BOM that would
     # otherwise end up glued to the first header name.
@@ -158,6 +210,10 @@ def main():
 
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
+    if fresh:
+        print(f"  No database yet — creating {args.db}")
+        conn.executescript(SCHEMA)
+        conn.commit()
 
     suppressed = load_suppression(conn)
     existing_contacts = {
@@ -265,12 +321,18 @@ def main():
 
     total_contacts = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
     total_companies = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
-    history = conn.execute("SELECT COUNT(*) FROM sent_emails").fetchone()[0]
+    try:
+        history = conn.execute("SELECT COUNT(*) FROM sent_emails").fetchone()[0]
+    except sqlite3.OperationalError:
+        history = None  # fresh database — send_emails.py creates this on first run
     conn.close()
 
     print(f"\n  Imported. Database now holds {total_contacts} contacts "
           f"across {total_companies} companies.")
-    print(f"  Send history preserved: {history} rows in sent_emails.\n")
+    if history is None:
+        print("  No send history yet — nothing has been emailed from this database.\n")
+    else:
+        print(f"  Send history preserved: {history} rows in sent_emails.\n")
 
 
 if __name__ == "__main__":
