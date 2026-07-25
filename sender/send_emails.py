@@ -142,8 +142,39 @@ def init_state_tables(conn: sqlite3.Connection):
     conn.commit()
 
 
-def already_sent(conn: sqlite3.Connection, email: str) -> bool:
-    return conn.execute("SELECT 1 FROM sent_emails WHERE email = ?", (email,)).fetchone() is not None
+def load_suppressed(conn: sqlite3.Connection) -> set:
+    """Every address that must never be emailed again, lowercased.
+
+    Checking sent_emails alone is not enough, on two counts.
+
+    Case: the comparison has to be case-insensitive. Hi@WeAreCatalystX.com was
+    emailed, and the bounce came back naming hi@wearecatalystx.com — the same
+    mailbox, stored as a second row, so sent_emails now holds one address twice
+    under two spellings, one marked sent and one bounced. A case-sensitive
+    lookup treats those as two different people, and would happily mail an
+    address whose history is filed under a different capitalization.
+
+    Sources: an address in opens_backup had a tracking pixel fire for it, so a
+    mail reached it and was opened — even where no sent_emails row survives
+    (history was consolidated into this database part-way through the
+    campaign, and 31 such addresses have opens but no send record). Bounces
+    and verification rejections are included for the same reason: they were
+    all contacted, or proven undeliverable, and must not be tried again.
+    """
+    suppressed = set()
+    for query in (
+        "SELECT email FROM sent_emails",
+        "SELECT email FROM failed_sends",
+        "SELECT email FROM wrong_address",
+        "SELECT DISTINCT email FROM opens_backup",
+    ):
+        try:
+            suppressed.update(
+                row[0].strip().lower() for row in conn.execute(query) if row[0]
+            )
+        except sqlite3.OperationalError:
+            pass  # table may not exist on a fresh database
+    return suppressed
 
 
 def sent_today(conn: sqlite3.Connection) -> int:
@@ -683,7 +714,7 @@ def check_and_sync_bounces(cfg: dict, conn: sqlite3.Connection) -> list:
         ).fetchone()
         if existing_sent:
             # Mark bounced so it stops counting against today's quota, but keep
-            # the row so already_sent() still guards against re-queuing it.
+            # the row so load_suppressed() still guards against re-queuing it.
             conn.execute("UPDATE sent_emails SET status='bounced' WHERE email = ?", (email,))
             company = existing_sent[0]
         else:
@@ -878,8 +909,18 @@ def main():
     all_contacts = fetch_contacts(conn)
     print(f"  Total contacts in DB: {len(all_contacts)}")
 
-    # Filter out already-sent
-    queue = [c for c in all_contacts if not already_sent(conn, c["contact_email"])]
+    # Filter out anyone already contacted, and collapse addresses that differ
+    # only by capitalization so one mailbox can't occupy two queue slots.
+    suppressed = load_suppressed(conn)
+    queue = []
+    queued_keys = set()
+    for c in all_contacts:
+        key = (c["contact_email"] or "").strip().lower()
+        if not key or key in suppressed or key in queued_keys:
+            continue
+        queued_keys.add(key)
+        queue.append(c)
+    print(f"  Already contacted   : {len(all_contacts) - len(queue)} (skipped)")
     print(f"  Unsent contacts     : {len(queue)}")
 
     if args.show_queue:
