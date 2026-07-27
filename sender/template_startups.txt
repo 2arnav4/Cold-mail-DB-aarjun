@@ -2,13 +2,25 @@ Subject: Internship Opportunity – {{company}}
 
 Hi {{first_name}},
 
-I recently came across {{company}} and really liked what you're building. I wanted to reach out to see if you might be looking for an intern to support the team.
+I hope you’re doing well.
 
-I'm Aarjun Jain, a second-year B.A. (Hons.) Economics student at Sri Guru Tegh Bahadur Khalsa College, Delhi University. I'm particularly interested in startups and enjoy working on problems related to strategy, operations, market research, product, and founder's office initiatives. I'm looking for an opportunity where I can learn by taking ownership of real work and contributing wherever needed.
+I recently came across {{company}} and wanted to reach out to inquire
+about any internship opportunities with your team.
 
-I've attached my resume, which provides more context about my background. I'd be grateful if you'd consider me for any relevant internship opportunities at {{company}}. If there's a potential fit, I'd be happy to connect.
+I’m Aarjun Jain, a final-year B.A. (Hons.) Economics student at Sri Guru
+Tegh Bahalsa College, University of Delhi. I’m interested in business
+strategy, market research, operations, and problem-solving, and I’m
+looking for an opportunity where I can apply these interests while
+learning from experienced professionals in a dynamic work environment.
 
-Thank you for your time, and I hope to hear from you.
+I’ve attached my resume for your reference. If there are any current or
+upcoming internship opportunities that align with my background, I’d be
+grateful for your consideration. I’d also be happy to speak further if
+you believe there could be a potential fit.
 
-Best Regards,
+Thank you for your time and consideration. I look forward to hearing
+from you.
+
+Best regards,
+
 Aarjun Jain

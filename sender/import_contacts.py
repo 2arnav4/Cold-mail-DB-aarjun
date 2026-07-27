@@ -34,7 +34,7 @@ import sys
 from datetime import datetime
 
 DB_PATH = "turso-full.db"
-DEFAULT_CSV = "Internship Database ST.csv"
+DEFAULT_CSV = "Copy of HR_LIST 300 - Sorted_HR_LIST.csv"
 
 # Column headers are not stable across the lists we get handed — "Contact
 # Details" in one file is "Email" in the next — so match on aliases instead of
