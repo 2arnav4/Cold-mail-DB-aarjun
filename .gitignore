@@ -2,6 +2,13 @@
 # All sender state (sent log, failed log, bounce cursor, opens backup) lives
 # inside turso-full.db now — *.db covers it, no separate log files needed.
 *.db
+# ...except the sender's database, now tracked deliberately so a clone carries
+# the live queue and send history instead of rebuilding from CSV. Private repo
+# only — it holds contact details and per-recipient open data. Caveat: it is a
+# binary git cannot merge, so if two checkouts both push it one silently
+# overwrites the other's send history. Pull before every send, and never send
+# from two machines at once.
+!sender/turso-full.db
 __pycache__/
 *.pyc
 *.pyo
